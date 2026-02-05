@@ -1,0 +1,107 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import numpy_financial as npf
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime
+
+# --- ローン計算関数 ---
+def calculate_loan(amount, annual_rate, years, type="元利均等"):
+    r = annual_rate / 12
+    n = years * 12
+    
+    if amount == 0:
+        return np.zeros(n), np.zeros(n), np.zeros(n)
+        
+    if type == "元利均等":
+        monthly_payment = (amount * r * (1+r)**n) / ((1+r)**n - 1)
+        payments = np.full(n, monthly_payment)
+        interest = np.zeros(n)
+        principal = np.zeros(n)
+        balance = amount
+        for i in range(n):
+            interest[i] = balance * r
+            principal[i] = monthly_payment - interest[i]
+            balance -= principal[i]
+    else:  # 元本均等
+        monthly_principal = amount / n
+        principal = np.full(n, monthly_principal)
+        interest = np.zeros(n)
+        balance = amount
+        for i in range(n):
+            interest[i] = balance * r
+            balance -= monthly_principal
+        payments = principal + interest
+        
+    return payments, principal, interest
+
+# --- メインロジック ---
+st.set_page_config(page_title="REI Pro-Sim v2", layout="wide")
+st.title("🏡 不動産投資シミュレーター Pro v2")
+
+# サイドバー設定
+with st.sidebar:
+    st.header("🏢 物件・融資詳細")
+    price = st.number_input("物件価格 (円)", value=100000000, step=1000000)
+    building_ratio = st.slider("建物比率 (%)", 0, 100, 60) / 100
+    loan_amount = st.number_input("借入額 (円)", value=80000000, step=1000000)
+    loan_years = st.number_input("借入期間 (年)", value=30, min_value=1)
+    loan_rate = st.slider("金利 (%)", 0.0, 5.0, 2.0, step=0.1) / 100
+    repayment_type = st.selectbox("返済方式", ["元利均等", "元本均等"])
+    
+    st.header("💰 運用・売却")
+    yield_rate = st.slider("想定表面利回り (%)", 3.0, 15.0, 7.0) / 100
+    holding_period = st.slider("保有期間 (年)", 1, 35, 10)
+    exit_price_ratio = st.slider("売却価格想定 (購入時比 %)", 50, 120, 90) / 100
+
+# 1. ローン計算実行
+m_pay, m_pri, m_int = calculate_loan(loan_amount, loan_rate, loan_years, repayment_type)
+
+# 2. 年単位の集計
+annual_repayment = []
+annual_interest = []
+for y in range(holding_period):
+    annual_repayment.append(m_pay[y*12:(y+1)*12].sum())
+    annual_interest.append(m_int[y*12:(y+1)*12].sum())
+
+# 3. キャッシュフロー計算
+df = pd.DataFrame({'Year': range(1, holding_period + 1)})
+df['Income'] = price * yield_rate
+df['Opex'] = df['Income'] * 0.20 # 管理費等20%固定
+df['Repayment'] = annual_repayment
+df['Net_CF'] = df['Income'] - df['Opex'] - df['Repayment']
+
+# 4. IRRの算出 (投資の入り口から出口まで)
+# [0年目: -自己資金, 1..N年目: 年間CF, 最後: 年間CF + 売却手取り]
+initial_investment = -(price - loan_amount) # 自己資金 (マイナス)
+cash_flows = [initial_investment] + df['Net_CF'].tolist()
+
+# 出口の計算 (売却価格 - ローン残債 - 譲渡税)
+exit_price = price * exit_price_ratio
+remaining_loan = loan_amount - m_pri[:holding_period*12].sum()
+capital_gain = exit_price - remaining_loan # 簡易的な手残り
+cash_flows[-1] += capital_gain
+
+irr = npf.irr(cash_flows)
+
+# --- 結果表示 ---
+c1, c2, c3 = st.columns(3)
+c1.metric("税引前CF (平均)", f"¥{df['Net_CF'].mean():,.0f}")
+c2.metric("IRR (内部収益率)", f"{irr*100:.2f}%" if irr else "計算不能")
+c3.metric("売却時ローン残債", f"¥{remaining_loan:,.0f}")
+
+# ローン返済の内訳可視化
+st.subheader("📊 返済プランと収支構造")
+fig_loan = go.Figure()
+fig_loan.add_trace(go.Bar(name='元本', x=df['Year'], y=np.array(annual_repayment)-np.array(annual_interest)))
+fig_loan.add_trace(go.Bar(name='利息', x=df['Year'], y=annual_interest))
+fig_loan.update_layout(barmode='stack', title="年間返済額の内訳 (元本 vs 利息)")
+st.plotly_chart(fig_loan, use_container_width=True)
+
+
+
+st.subheader("📈 累積キャッシュフローの推移")
+df['Cumulative_CF'] = df['Net_CF'].cumsum() + initial_investment
+fig_cum = px.area(df, x='Year', y='Cumulative_CF', title="自己資金回収の推移 (マイナスは未回収)")
+st.plotly_chart(fig_cum, use_container_width=True)
